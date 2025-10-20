@@ -62,8 +62,19 @@ func Run(ctx context.Context, fromBackup string, fsys afero.Fs) error {
 
 func NewContainerConfig(args ...string) container.Config {
 	if utils.Config.Db.MajorVersion >= 14 {
-		// Extensions schema does not exist on PG13 and below
-		args = append(args, "-c", "search_path='$user,public,extensions'")
+		// Only add default search_path if not already specified
+		// Check if any arg contains "search_path"
+		hasSearchPath := false
+		for _, arg := range args {
+			if strings.Contains(arg, "search_path") {
+				hasSearchPath = true
+				break
+			}
+		}
+		if !hasSearchPath {
+			// Extensions schema does not exist on PG13 and below
+			args = append(args, "-c", "search_path='$user,public,extensions'")
+		}
 	}
 	env := []string{
 		"POSTGRES_PASSWORD=" + utils.Config.Db.Password,

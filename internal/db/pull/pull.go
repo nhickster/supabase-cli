@@ -43,6 +43,11 @@ func Run(ctx context.Context, schema []string, config pgconn.Config, name string
 	timestamp := utils.GetCurrentTimestamp()
 	path := new.GetMigrationPath(timestamp, name)
 	if err := run(ctx, schema, path, conn, fsys); err != nil {
+		// errInSync is not really an error - just means no changes found
+		if errors.Is(err, errInSync) {
+			fmt.Fprintln(os.Stderr, errInSync.Error())
+			return nil
+		}
 		return err
 	}
 	// 3. Insert a row to `schema_migrations`
@@ -127,8 +132,15 @@ func diffUserSchemas(ctx context.Context, schema []string, path string, config p
 			user = append(user, s)
 		}
 	}
+
 	fmt.Fprintln(os.Stderr, "Creating shadow database...")
-	shadow, err := diff.CreateShadowDatabase(ctx, utils.Config.Db.ShadowPort)
+	// Query remote's search_path and configure shadow to match
+	targetSearchPath, err := diff.GetSearchPath(ctx, config)
+	if err != nil {
+		// Fall back to default if we can't query remote
+		targetSearchPath = ""
+	}
+	shadow, err := diff.CreateShadowDatabaseWithSearchPath(ctx, utils.Config.Db.ShadowPort, targetSearchPath)
 	if err != nil {
 		return err
 	}
@@ -139,6 +151,9 @@ func diffUserSchemas(ctx context.Context, schema []string, path string, config p
 	if err := diff.MigrateShadowDatabase(ctx, shadow, fsys); err != nil {
 		return err
 	}
+
+	// CRITICAL FIX: Set search_path on shadow database to match remote
+	// This ensures pg_get_expr() normalizes column defaults the same way when migra queries
 	shadowConfig := pgconn.Config{
 		Host:     utils.Config.Hostname,
 		Port:     utils.Config.Db.ShadowPort,
@@ -146,6 +161,49 @@ func diffUserSchemas(ctx context.Context, schema []string, path string, config p
 		Password: utils.Config.Db.Password,
 		Database: "postgres",
 	}
+
+	fmt.Fprintf(os.Stderr, "[DEBUG pull.go] Connecting to shadow database to set search_path...\n")
+	conn, err := utils.ConnectByConfig(ctx, shadowConfig)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(ctx)
+
+	// Check current search_path
+	var currentPath string
+	err = conn.QueryRow(ctx, "SHOW search_path").Scan(&currentPath)
+	if err != nil {
+		return fmt.Errorf("failed to query current search_path: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "[DEBUG pull.go] Shadow DB current search_path: %s\n", currentPath)
+	fmt.Fprintf(os.Stderr, "[DEBUG pull.go] Target search_path from remote: %s\n", targetSearchPath)
+
+	// Set database-level search_path to match remote
+	// PostgreSQL search_path with $user variable needs double quotes around individual elements
+	// Format: ALTER DATABASE SET search_path = "$user", public
+	// Replace $ with double-quoted "$user" if present
+	formattedSearchPath := strings.ReplaceAll(targetSearchPath, "$user", "\"$user\"")
+	alterDbSQL := fmt.Sprintf("ALTER DATABASE postgres SET search_path = %s", formattedSearchPath)
+	fmt.Fprintf(os.Stderr, "[DEBUG pull.go] Executing: %s\n", alterDbSQL)
+	if _, err := conn.Exec(ctx, alterDbSQL); err != nil {
+		return fmt.Errorf("failed to set shadow database search_path: %w", err)
+	}
+
+	// Close and reconnect to verify the setting took effect
+	conn.Close(ctx)
+	fmt.Fprintf(os.Stderr, "[DEBUG pull.go] Reconnecting to verify search_path...\n")
+	conn, err = utils.ConnectByConfig(ctx, shadowConfig)
+	if err != nil {
+		return err
+	}
+	err = conn.QueryRow(ctx, "SHOW search_path").Scan(&currentPath)
+	if err != nil {
+		conn.Close(ctx)
+		return fmt.Errorf("failed to verify search_path: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "[DEBUG pull.go] Shadow DB search_path AFTER ALTER DATABASE: %s\n", currentPath)
+	conn.Close(ctx)
+
 	// Diff managed and user defined schemas separately
 	var output string
 	if len(user) > 0 {
@@ -162,7 +220,9 @@ func diffUserSchemas(ctx context.Context, schema []string, path string, config p
 			output += result
 		}
 	}
-	if len(output) == 0 {
+
+	// Check if output is empty or contains only whitespace
+	if len(strings.TrimSpace(output)) == 0 {
 		return errors.New(errInSync)
 	}
 	if err := utils.WriteFile(path, []byte(output), fsys); err != nil {

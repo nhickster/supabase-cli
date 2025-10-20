@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -70,22 +71,67 @@ func NewMigrationFromReader(sql io.Reader) (*MigrationFile, error) {
 }
 
 func (m *MigrationFile) ExecBatch(ctx context.Context, conn *pgx.Conn) error {
+	// DIAGNOSTIC: Log statements being batched
+	fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Starting v11 - session-level SET before batch\n")
+	fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Processing %d statements\n", len(m.Statements))
+	
+	// Look for set_config search_path statement
+	setConfigIdx := -1
+	for i, stmt := range m.Statements {
+		stmtLower := strings.ToLower(stmt)
+		if strings.Contains(stmtLower, "set_config") && strings.Contains(stmtLower, "search_path") {
+			setConfigIdx = i
+			fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Found set_config at statement %d\n", i)
+			break
+		}
+	}
+	
+	// THE REAL FIX: Set search_path at SESSION level OUTSIDE any transaction
+	// This way it persists through the implicit transaction created by ExecBatch
+	if setConfigIdx >= 0 {
+		fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Setting SESSION search_path = pg_catalog (no extensions!)\n")
+		if _, err := conn.Exec(ctx, "SET search_path = pg_catalog"); err != nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: ERROR setting search_path: %v\n", err)
+			return errors.Errorf("failed to set search_path: %w", err)
+		}
+		
+		// Verify it worked
+		var newSearchPath string
+		if err := conn.QueryRow(ctx, "SHOW search_path").Scan(&newSearchPath); err == nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Session search_path NOW: %s\n", newSearchPath)
+		}
+	}
+	
 	// Batch migration commands, without using statement cache
 	batch := &pgconn.Batch{}
-	for _, line := range m.Statements {
+	for i, line := range m.Statements {
+		// Skip the original set_config statement - we handled it above
+		if i == setConfigIdx {
+			fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Skipping original set_config statement at position %d\n", i)
+			continue
+		}
 		batch.ExecParams(line, nil, nil, nil, nil)
 	}
+	
 	// Insert into migration history
 	if len(m.Version) > 0 {
 		if err := m.insertVersionSQL(conn, batch); err != nil {
 			return err
 		}
 	}
+	
+	fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Executing batch with search_path=%s...\n", "pg_catalog")
+	
 	// ExecBatch is implicitly transactional
-	if result, err := conn.PgConn().ExecBatch(ctx, batch).ReadAll(); err != nil {
+	result, err := conn.PgConn().ExecBatch(ctx, batch).ReadAll()
+	if err != nil {
 		// Defaults to printing the last statement on error
 		stat := INSERT_MIGRATION_VERSION
 		i := len(result)
+		// Account for skipped set_config statement
+		if setConfigIdx >= 0 && i >= setConfigIdx {
+			i++
+		}
 		if i < len(m.Statements) {
 			stat = m.Statements[i]
 		}
@@ -100,6 +146,85 @@ func (m *MigrationFile) ExecBatch(ctx context.Context, conn *pgx.Conn) error {
 		msg = append(msg, fmt.Sprintf("At statement: %d", i), stat)
 		return errors.Errorf("%w\n%s", err, strings.Join(msg, "\n"))
 	}
+	
+	fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Batch executed successfully (%d results)\n", len(result))
+	
+	// DIAGNOSTIC: Check column defaults that were created
+	// Query with search_path = pg_catalog to see if normalization changes
+	rows, err := conn.Query(ctx, `
+		SELECT c.table_name, c.column_name, c.column_default
+		FROM information_schema.columns c
+		WHERE c.table_schema = 'public' 
+		  AND c.column_name = 'id'
+		  AND c.column_default LIKE '%uuid_generate_v4%'
+		ORDER BY c.table_name
+		LIMIT 5
+	`)
+	if err == nil {
+		defer rows.Close()
+		fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Column defaults WITH search_path=pg_catalog:\n")
+		for rows.Next() {
+			var tableName, columnName, columnDefault string
+			if err := rows.Scan(&tableName, &columnName, &columnDefault); err == nil {
+				fmt.Fprintf(os.Stderr, "[DEBUG]   %s.%s: %s\n", tableName, columnName, columnDefault)
+			}
+		}
+	}
+	
+	// Reset search_path to default after migration completes
+	if setConfigIdx >= 0 {
+		fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Resetting search_path to default\n")
+		conn.Exec(ctx, "RESET search_path")
+		
+		// Now query AGAIN with the default search_path to see if it changes
+		rows2, err := conn.Query(ctx, `
+			SELECT c.table_name, c.column_name, c.column_default
+			FROM information_schema.columns c
+			WHERE c.table_schema = 'public' 
+			  AND c.column_name = 'id'
+			  AND c.column_default LIKE '%uuid_generate_v4%'
+			ORDER BY c.table_name
+			LIMIT 5
+		`)
+		if err == nil {
+			defer rows2.Close()
+			fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Column defaults AFTER RESET (search_path has extensions):\n")
+			for rows2.Next() {
+				var tableName, columnName, columnDefault string
+				if err := rows2.Scan(&tableName, &columnName, &columnDefault); err == nil {
+					fmt.Fprintf(os.Stderr, "[DEBUG]   %s.%s: %s\n", tableName, columnName, columnDefault)
+				}
+			}
+		}
+		
+		// Also check the RAW pg_attrdef to see what's ACTUALLY stored
+		fmt.Fprintf(os.Stderr, "[DEBUG] ExecBatch: Checking RAW pg_attrdef.adbin (what's ACTUALLY stored):\n")
+		rows3, err := conn.Query(ctx, `
+			SELECT 
+				c.relname AS table_name,
+				a.attname AS column_name,
+				pg_get_expr(d.adbin, d.adrelid) AS column_default
+			FROM pg_catalog.pg_attrdef d
+			JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+			JOIN pg_catalog.pg_class c ON c.oid = d.adrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = 'public'
+			  AND a.attname = 'id'
+			  AND pg_get_expr(d.adbin, d.adrelid) LIKE '%uuid_generate_v4%'
+			ORDER BY c.relname
+			LIMIT 5
+		`)
+		if err == nil {
+			defer rows3.Close()
+			for rows3.Next() {
+				var tableName, columnName, columnDefault string
+				if err := rows3.Scan(&tableName, &columnName, &columnDefault); err == nil {
+					fmt.Fprintf(os.Stderr, "[DEBUG]   %s.%s: %s\n", tableName, columnName, columnDefault)
+				}
+			}
+		}
+	}
+	
 	return nil
 }
 

@@ -89,9 +89,68 @@ func findDropStatements(out string) []string {
 	return drops
 }
 
+// GetSearchPath queries the target database to get its current search_path setting
+// This ensures the shadow database can be configured with the same search_path
+func GetSearchPath(ctx context.Context, config pgconn.Config, options ...func(*pgx.ConnConfig)) (string, error) {
+	conn, err := utils.ConnectByConfig(ctx, config, options...)
+	if err != nil {
+		return "", errors.Errorf("failed to connect to target database: %w", err)
+	}
+	defer conn.Close(context.Background())
+
+	var searchPath string
+	// Query the current search_path setting
+	err = conn.QueryRow(ctx, "SHOW search_path").Scan(&searchPath)
+	if err != nil {
+		return "", errors.Errorf("failed to query search_path: %w", err)
+	}
+
+	// PostgreSQL's SHOW search_path returns quoted identifiers like "$user", public
+	// We need to normalize this for use in the -c flag
+	// Strip the outer quotes if present and normalize
+	searchPath = strings.TrimSpace(searchPath)
+
+	// PostgreSQL uses double quotes for identifiers, but for the search_path config
+	// we need to remove them to avoid double-quoting issues
+	// Example: "$user", public -> $user, public
+	searchPath = strings.ReplaceAll(searchPath, "\"", "")
+
+	return searchPath, nil
+}
+
 func CreateShadowDatabase(ctx context.Context, port uint16) (string, error) {
+	return CreateShadowDatabaseWithSearchPath(ctx, port, "")
+}
+
+func CreateShadowDatabaseWithSearchPath(ctx context.Context, port uint16, searchPath string) (string, error) {
 	// Disable background workers in shadow database
-	config := start.NewContainerConfig("-c", "max_worker_processes=0")
+	args := []string{"-c", "max_worker_processes=0"}
+
+	// CRITICAL FIX: The remote database has search_path='$user,public' (WITHOUT extensions)
+	// But NewContainerConfig adds search_path='$user,public,extensions' for PostgreSQL 14+
+	// This causes PostgreSQL to normalize "extensions"."uuid_generate_v4"() differently:
+	// - With extensions in path: stored as uuid_generate_v4() (unqualified)
+	// - Without extensions in path: stored as extensions.uuid_generate_v4() (qualified)
+	// We MUST match the remote's search_path exactly
+
+	if searchPath == "" {
+		// Default to excluding extensions to match typical Supabase remote setup
+		searchPath = "$user, public"
+	}
+
+	// Override the default search_path by adding it as an argument
+	// PostgreSQL uses the LAST -c search_path value
+	searchPathArg := fmt.Sprintf("search_path='%s'", searchPath)
+	args = append(args, "-c", searchPathArg)
+
+	fmt.Fprintf(os.Stderr, "[DEBUG diff.go] Target search_path for shadow: %s\n", searchPath)
+	fmt.Fprintf(os.Stderr, "[DEBUG diff.go] Args BEFORE NewContainerConfig: %v\n", args)
+
+	config := start.NewContainerConfig(args...)
+
+	fmt.Fprintf(os.Stderr, "[DEBUG diff.go] Docker CMD after NewContainerConfig: %v\n", config.Cmd)
+	fmt.Fprintf(os.Stderr, "[DEBUG diff.go] Docker Entrypoint: %v\n", config.Entrypoint)
+
 	hostPort := strconv.FormatUint(uint64(port), 10)
 	hostConfig := container.HostConfig{
 		PortBindings: nat.PortMap{"5432/tcp": []nat.PortBinding{{HostPort: hostPort}}},
@@ -127,18 +186,105 @@ func MigrateShadowDatabase(ctx context.Context, container string, fsys afero.Fs,
 		return err
 	}
 	defer conn.Close(context.Background())
+
 	if err := start.SetupDatabase(ctx, conn, container[:12], os.Stderr, fsys); err != nil {
 		return err
 	}
+
 	if _, err := conn.Exec(ctx, CREATE_TEMPLATE); err != nil {
 		return errors.Errorf("failed to create template database: %w", err)
 	}
-	return migration.ApplyMigrations(ctx, migrations, conn, afero.NewIOFS(fsys))
+
+	fmt.Fprintf(os.Stderr, "[DEBUG] Applying %d local migrations to shadow database...\n", len(migrations))
+
+	// DIAGNOSTIC: Check shadow DB search_path before migrations
+	var searchPathBefore string
+	if err := conn.QueryRow(ctx, "SHOW search_path").Scan(&searchPathBefore); err != nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Could not query search_path before migrations: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Shadow search_path BEFORE migrations: %s\n", searchPathBefore)
+	}
+
+	if err := migration.ApplyMigrations(ctx, migrations, conn, afero.NewIOFS(fsys)); err != nil {
+		return err
+	}
+
+	// DIAGNOSTIC: Check shadow DB search_path after migrations
+	var searchPathAfter string
+	if err := conn.QueryRow(ctx, "SHOW search_path").Scan(&searchPathAfter); err != nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Could not query search_path after migrations: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Shadow search_path AFTER migrations: %s\n", searchPathAfter)
+	}
+
+	// DIAGNOSTIC: Check actual column defaults stored in shadow DB
+	fmt.Fprintf(os.Stderr, "[DEBUG] Querying column defaults from shadow database...\n")
+	rows, err := conn.Query(ctx, `
+		SELECT table_name, column_name, column_default
+		FROM information_schema.columns
+		WHERE table_schema = 'public' 
+		  AND column_default LIKE '%uuid_generate_v4%'
+		ORDER BY table_name
+		LIMIT 5
+	`)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Could not query column defaults: %v\n", err)
+	} else {
+		defer rows.Close()
+		fmt.Fprintf(os.Stderr, "[DEBUG] Column defaults in SHADOW database:\n")
+		for rows.Next() {
+			var tableName, columnName, columnDefault string
+			if err := rows.Scan(&tableName, &columnName, &columnDefault); err == nil {
+				fmt.Fprintf(os.Stderr, "[DEBUG]   %s.%s: %s\n", tableName, columnName, columnDefault)
+			}
+		}
+	}
+
+	return nil
 }
 
 func DiffDatabase(ctx context.Context, schema []string, config pgconn.Config, w io.Writer, fsys afero.Fs, differ DiffFunc, options ...func(*pgx.ConnConfig)) (string, error) {
+	// DIAGNOSTIC: Check target database column defaults BEFORE creating shadow
+	fmt.Fprintln(w, "Connecting to remote database...")
+	targetConn, err := utils.ConnectByConfig(ctx, config, options...)
+	if err != nil {
+		return "", errors.Errorf("failed to connect to target database: %w", err)
+	}
+
+	fmt.Fprintf(w, "[DEBUG] Querying column defaults from TARGET (remote/local) database...\n")
+	targetRows, err := targetConn.Query(ctx, `
+		SELECT table_name, column_name, column_default
+		FROM information_schema.columns
+		WHERE table_schema = 'public' 
+		  AND column_name = 'id'
+		  AND column_default LIKE '%uuid_generate_v4%'
+		ORDER BY table_name
+		LIMIT 5
+	`)
+	if err != nil {
+		fmt.Fprintf(w, "[DEBUG] Could not query target column defaults: %v\n", err)
+	} else {
+		defer targetRows.Close()
+		fmt.Fprintf(w, "[DEBUG] Column defaults in TARGET database:\n")
+		for targetRows.Next() {
+			var tableName, columnName, columnDefault string
+			if err := targetRows.Scan(&tableName, &columnName, &columnDefault); err == nil {
+				fmt.Fprintf(w, "[DEBUG]   %s.%s: %s\n", tableName, columnName, columnDefault)
+			}
+		}
+	}
+	targetConn.Close(ctx)
+
+	// Query the target database's search_path before creating shadow
+	// This ensures shadow DB will be configured with the same search_path
+	targetSearchPath, err := GetSearchPath(ctx, config, options...)
+	if err != nil {
+		fmt.Fprintf(w, "Warning: Could not determine target search_path, using default: %v\n", err)
+		targetSearchPath = "" // Fall back to default ($user, public without extensions)
+	}
+
 	fmt.Fprintln(w, "Creating shadow database...")
-	shadow, err := CreateShadowDatabase(ctx, utils.Config.Db.ShadowPort)
+	shadow, err := CreateShadowDatabaseWithSearchPath(ctx, utils.Config.Db.ShadowPort, targetSearchPath)
 	if err != nil {
 		return "", err
 	}
